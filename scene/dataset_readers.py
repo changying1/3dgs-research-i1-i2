@@ -23,6 +23,15 @@ from plyfile import PlyData, PlyElement
 from utils.sh_utils import SH2RGB
 from scene.gaussian_model import BasicPointCloud
 from utils import pose_utils
+from llff_view_protocol import (
+    ColmapImageRecord,
+    ViewProtocolError,
+    build_view_manifest,
+    canonical_image_name,
+    image_path as protocol_image_path,
+    load_view_manifest,
+    validate_colmap_records,
+)
 
 
 class CameraInfo(NamedTuple):
@@ -69,7 +78,11 @@ def getNerfppNorm(cam_info):
 
 def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
     cam_infos = []
-    for idx, key in enumerate(cam_extrinsics):
+    sorted_keys = sorted(
+        cam_extrinsics,
+        key=lambda key: canonical_image_name(cam_extrinsics[key].name),
+    )
+    for idx, key in enumerate(sorted_keys):
         sys.stdout.write('\r')
         # the exact output you're looking for:
         sys.stdout.write("Reading camera {}/{}".format(idx+1, len(cam_extrinsics)))
@@ -96,12 +109,12 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
         else:
             assert False, "Colmap camera model not handled: only undistorted datasets (PINHOLE or SIMPLE_PINHOLE cameras) supported!"
 
-        image_path = os.path.join(images_folder, os.path.basename(extr.name))
-        image_name = os.path.basename(image_path).split(".")[0]
+        image_path = protocol_image_path(images_folder, extr.name)
+        image_name = image_path.stem
         image = Image.open(image_path)
 
         cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
-                              image_path=image_path, image_name=image_name, width=width, height=height)
+                              image_path=str(image_path), image_name=image_name, width=width, height=height)
         cam_infos.append(cam_info)
     sys.stdout.write('\n')
     return cam_infos
@@ -134,21 +147,39 @@ def storePly(path, xyz, rgb):
     ply_data = PlyData([vertex_element])
     ply_data.write(path)
 
-def readColmapSceneInfo(path, images, eval, n_views, dataset_name, suffix=None, llffhold=8):
-    try:
-        cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.bin")
-        cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.bin")
+def readColmapSceneInfo(path, images, eval, n_views, dataset_name, suffix=None,
+                        llffhold=8, view_manifest=""):
+    cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.bin")
+    cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.bin")
+    cameras_extrinsic_text = os.path.join(path, "sparse/0", "images.txt")
+    cameras_intrinsic_text = os.path.join(path, "sparse/0", "cameras.txt")
+    if os.path.isfile(cameras_extrinsic_file) and os.path.isfile(cameras_intrinsic_file):
         cam_extrinsics = read_extrinsics_binary(cameras_extrinsic_file)
         cam_intrinsics = read_intrinsics_binary(cameras_intrinsic_file)
-    except:
-        cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.txt")
-        cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.txt")
-        cam_extrinsics = read_extrinsics_text(cameras_extrinsic_file)
-        cam_intrinsics = read_intrinsics_text(cameras_intrinsic_file)
+    elif os.path.isfile(cameras_extrinsic_text) and os.path.isfile(cameras_intrinsic_text):
+        cam_extrinsics = read_extrinsics_text(cameras_extrinsic_text)
+        cam_intrinsics = read_intrinsics_text(cameras_intrinsic_text)
+    else:
+        raise ViewProtocolError(
+            "COLMAP model must contain a complete images/cameras .bin pair or .txt pair"
+        )
 
     reading_dir = "images" if images == None else images
-    cam_infos_unsorted = readColmapCameras(cam_extrinsics=cam_extrinsics, cam_intrinsics=cam_intrinsics, images_folder=os.path.join(path, reading_dir))
-    cam_infos = sorted(cam_infos_unsorted.copy(), key = lambda x : x.image_name)
+    images_folder = os.path.join(path, reading_dir)
+    records = [
+        ColmapImageRecord(extr.id, extr.camera_id, extr.name)
+        for extr in cam_extrinsics.values()
+    ]
+    ordered_records = validate_colmap_records(records, cam_intrinsics.keys(), images_folder)
+    cam_infos = readColmapCameras(
+        cam_extrinsics=cam_extrinsics,
+        cam_intrinsics=cam_intrinsics,
+        images_folder=images_folder,
+    )
+    ordered_names = [record.image_name for record in ordered_records]
+    if len(cam_infos) != len(ordered_names):
+        raise ViewProtocolError("COLMAP camera and image-name counts do not match")
+    cam_by_name = dict(zip(ordered_names, cam_infos))
 
     ply_path = os.path.join(path, "sparse/0/points3D.ply")
     bin_path = os.path.join(path, "sparse/0/points3D.bin")
@@ -169,10 +200,25 @@ def readColmapSceneInfo(path, images, eval, n_views, dataset_name, suffix=None, 
             test_cam_infos = [cam_infos[idx] for idx in dtu_test_indices]
             train_cam_infos = train_cam_infos[:n_views]
         elif dataset_name == "LLFF":
-            train_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold != 0]
-            test_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold == 0]
-            idx_sub = [round(i) for i in np.linspace(0, len(train_cam_infos) - 1, n_views)]
-            train_cam_infos = [c for idx, c in enumerate(train_cam_infos) if idx in idx_sub]
+            scene_name = os.path.basename(os.path.normpath(path))
+            if view_manifest:
+                manifest = load_view_manifest(
+                    view_manifest,
+                    current_image_names=ordered_names,
+                    expected_dataset="LLFF",
+                    expected_scene=scene_name,
+                    expected_view_count=n_views,
+                )
+            else:
+                manifest = build_view_manifest(
+                    dataset="LLFF",
+                    scene=scene_name,
+                    image_names=ordered_names,
+                    view_count=n_views,
+                    source_commit="UNRECORDED-LEGACY-ENTRY",
+                )
+            train_cam_infos = [cam_by_name[name] for name in manifest["selected_train_images"]]
+            test_cam_infos = [cam_by_name[name] for name in manifest["test_images"]]
         else:
             raise  NotImplementedError(dataset_name)
     else:

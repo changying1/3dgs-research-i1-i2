@@ -35,14 +35,23 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor,
     # Set up rasterization configuration
     tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
     tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
+    opacity = pc.get_opacity
     
     # init random dropout mask
     if dropout_factor > 0.0 and train:
-        dropout_mask = torch.rand(pc.get_opacity.shape[0], device=pc.get_opacity.device).cuda()
+        dropout_mask = torch.rand(opacity.shape[0], device=opacity.device).cuda()
         dropout_mask = dropout_mask < (1 - dropout_factor)
     else:
-        dropout_mask = torch.rand(pc.get_opacity.shape[0], device=pc.get_opacity.device).cuda()
+        dropout_mask = torch.rand(opacity.shape[0], device=opacity.device).cuda()
         dropout_mask = dropout_mask < 1.1
+
+    # The installed FSGS rasterizer scales per-Gaussian gradients by confidence.
+    # Unit confidence preserves the existing gradients and must match the exact
+    # Gaussian subset passed to the rasterizer after training-time dropout.
+    if dropout_factor > 0.0 and train:
+        raster_confidence = torch.ones_like(opacity[dropout_mask], requires_grad=False)
+    else:
+        raster_confidence = torch.ones_like(opacity, requires_grad=False)
 
     raster_settings = GaussianRasterizationSettings(
         image_height=int(viewpoint_camera.image_height),
@@ -56,14 +65,14 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor,
         sh_degree=pc.active_sh_degree,
         campos=viewpoint_camera.camera_center,
         prefiltered=False,
-        debug=pipe.debug
+        debug=pipe.debug,
+        confidence=raster_confidence
     )
 
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
 
     means3D = pc.get_xyz
     means2D = screenspace_points
-    opacity = pc.get_opacity
 
     # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
     # scaling / rotation by the rasterizer.
@@ -105,7 +114,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor,
         rotations    = rotations[dropout_mask]
     elif (not train):
         # scale oapcity for test stage rendering
-        opacity *= 1 - dropout_factor
+        opacity = opacity * (1 - dropout_factor)
         
     # 2. add noise to opacity during training
     if train and sigma_noise > 0.0:

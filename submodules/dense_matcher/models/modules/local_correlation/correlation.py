@@ -275,9 +275,26 @@ def cupy_kernel(strFunction, objectVariables):
     return strKernel
 
 
+def _compile_kernel(strFunction, strKernel):
+    """Compile a generated CUDA kernel through CuPy's public cached API."""
+    raw_module = getattr(cupy, 'RawModule', None)
+    if raw_module is None:
+        raise RuntimeError('Local-correlation CUDA kernels require cupy.RawModule.')
+
+    try:
+        # The removed compile_with_cache call used NVRTC with no explicit
+        # compiler options. RawModule has the same defaults and disk cache.
+        module = raw_module(code=strKernel, options=(), backend='nvrtc')
+        return module.get_function(strFunction)
+    except Exception as error:
+        raise RuntimeError(
+            "Failed to compile or retrieve local-correlation CUDA kernel {!r}: {}".format(strFunction, error)
+        ) from error
+
+
 @cupyutil.memoize(for_each_device=True)
 def cupy_launch(strFunction, strKernel):
-    return cupy.cuda.compile_with_cache(strKernel).get_function(strFunction)
+    return _compile_kernel(strFunction, strKernel)
 
 
 class _FunctionCorrelation(torch.autograd.Function):

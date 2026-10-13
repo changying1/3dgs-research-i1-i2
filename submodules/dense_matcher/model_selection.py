@@ -1,4 +1,5 @@
 import os.path as osp
+import pickle
 import torch
 import os
 
@@ -11,7 +12,35 @@ from models.semantic_matching_models.NCNet import NCNetWithBin, ImMatchNet
 from models.semantic_matching_models.cats import CATs
 
 
-def load_network(net, checkpoint_path=None, **kwargs):
+def _load_pdcnet_plus_megadepth_checkpoint(checkpoint_path):
+    """Safely load the legacy PDCNet+ MegaDepth checkpoint on PyTorch 2.8+."""
+    from admin.local import EnvironmentSettings
+    from admin.model_constructor import NetConstructor
+    from admin.settings import Settings
+    from admin.stats import AverageMeter, StatValue
+
+    allowed_globals = [NetConstructor, EnvironmentSettings, Settings, AverageMeter, StatValue]
+    try:
+        # Keep the allowlist scoped to this single load; do not mutate PyTorch's
+        # process-wide safe-global registry.
+        with torch.serialization.safe_globals(allowed_globals):
+            checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=True)
+    except pickle.UnpicklingError as error:
+        raise RuntimeError(
+            'Refused to load the PDCNet+ MegaDepth checkpoint because it contains '
+            'a type outside the local safe-global allowlist: {}'.format(error)
+        ) from error
+
+    if not isinstance(checkpoint, dict) or 'state_dict' not in checkpoint:
+        raise RuntimeError(
+            'The PDCNet+ MegaDepth checkpoint must be a dictionary containing state_dict.'
+        )
+    if not isinstance(checkpoint['state_dict'], dict):
+        raise RuntimeError('The PDCNet+ MegaDepth checkpoint state_dict must be a dictionary.')
+    return checkpoint
+
+
+def load_network(net, checkpoint_path=None, safe_pdcnet_plus_megadepth=False, **kwargs):
     """Loads a network checkpoint file.
     args:
         net: network architecture
@@ -23,13 +52,26 @@ def load_network(net, checkpoint_path=None, **kwargs):
     if not os.path.isfile(checkpoint_path):
         raise ValueError('The checkpoint that you chose does not exist, {}'.format(checkpoint_path))
 
-    # Load checkpoint
-    checkpoint_dict = torch.load(checkpoint_path, map_location='cpu')
+    # Only this legacy checkpoint gets the narrow PyTorch 2.8 safe-loading
+    # compatibility path. Other model configurations retain their old behavior.
+    if safe_pdcnet_plus_megadepth:
+        checkpoint_dict = _load_pdcnet_plus_megadepth_checkpoint(checkpoint_path)
+    else:
+        checkpoint_dict = torch.load(checkpoint_path, map_location='cpu')
 
     if 'state_dict' in checkpoint_dict:
         checkpoint_dict = checkpoint_dict['state_dict']
 
-    net.load_state_dict(checkpoint_dict, strict=False)
+    if safe_pdcnet_plus_megadepth:
+        try:
+            net.load_state_dict(checkpoint_dict, strict=True)
+        except RuntimeError as error:
+            raise RuntimeError(
+                'PDCNet+ MegaDepth checkpoint parameters do not exactly match the model '
+                '(missing key, unexpected key, or shape mismatch): {}'.format(error)
+            ) from error
+    else:
+        net.load_state_dict(checkpoint_dict, strict=False)
     return net
 
 
@@ -230,7 +272,11 @@ def select_model(model_name, pre_trained_model_type, arguments, global_optim_ite
     if not os.path.exists(checkpoint_fname):
         raise ValueError('The checkpoint that you chose does not exist, {}'.format(checkpoint_fname))
 
-    network = load_network(network, checkpoint_path=checkpoint_fname)
+    network = load_network(
+        network,
+        checkpoint_path=checkpoint_fname,
+        safe_pdcnet_plus_megadepth=(model_name == 'PDCNet_plus' and pre_trained_model_type == 'megadepth'),
+    )
     network.eval()
     network = network.to(device)
 

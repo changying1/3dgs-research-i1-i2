@@ -350,7 +350,7 @@ class GaussianModel:
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
-    def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
+    def densify_and_split(self, grads, grad_threshold, scene_extent, N=2, collect_diagnostics=False):
         n_init_points = self.get_xyz.shape[0]
         # Extract points that satisfy the gradient condition
         padded_grad = torch.zeros((n_init_points), device="cuda")
@@ -370,12 +370,25 @@ class GaussianModel:
         new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1)
         new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
 
+        if collect_diagnostics:
+            split_children_created = new_xyz.shape[0]
+            split_parents_selected = split_children_created // N
+
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation)
 
+        if collect_diagnostics:
+            gaussians_before_split_parent_prune = self.get_xyz.shape[0]
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
 
-    def densify_and_clone(self, grads, grad_threshold, scene_extent):
+        if collect_diagnostics:
+            return {
+                "split_parents_selected": split_parents_selected,
+                "split_children_created": split_children_created,
+                "split_parents_deleted": gaussians_before_split_parent_prune - self.get_xyz.shape[0],
+            }
+
+    def densify_and_clone(self, grads, grad_threshold, scene_extent, collect_diagnostics=False):
         # Extract points that satisfy the gradient condition
         selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
         selected_pts_mask = torch.logical_and(selected_pts_mask,
@@ -388,23 +401,56 @@ class GaussianModel:
         new_scaling = self._scaling[selected_pts_mask]
         new_rotation = self._rotation[selected_pts_mask]
 
+        if collect_diagnostics:
+            clone_added = new_xyz.shape[0]
+
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation)
 
-    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size):
+        if collect_diagnostics:
+            return clone_added
+
+    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, collect_diagnostics=False):
+        if collect_diagnostics:
+            gaussians_before = self.get_xyz.shape[0]
+
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
 
-        self.densify_and_clone(grads, max_grad, extent)
-        self.densify_and_split(grads, max_grad, extent)
+        clone_added = self.densify_and_clone(grads, max_grad, extent, collect_diagnostics=collect_diagnostics)
+        split_counts = self.densify_and_split(grads, max_grad, extent, collect_diagnostics=collect_diagnostics)
 
-        prune_mask = (self.get_opacity < min_opacity).squeeze()
+        opacity_prune_mask = (self.get_opacity < min_opacity).squeeze()
+        prune_mask = opacity_prune_mask
         if max_screen_size:
             big_points_vs = self.max_radii2D > max_screen_size
             big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
             prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
+        if collect_diagnostics:
+            gaussians_before_prune = self.get_xyz.shape[0]
+            # Diagnostics are opt-in: this scalar transfer/synchronization never
+            # occurs on the baseline path.
+            opacity_prune_deleted = int(torch.count_nonzero(opacity_prune_mask).item())
         self.prune_points(prune_mask)
 
+        if collect_diagnostics:
+            gaussians_after = self.get_xyz.shape[0]
+            prune_deleted_total = gaussians_before_prune - gaussians_after
+            event_counts = {
+                "gaussians_before": gaussians_before,
+                "clone_added": clone_added,
+                "split_parents_selected": split_counts["split_parents_selected"],
+                "split_children_created": split_counts["split_children_created"],
+                "split_parents_deleted": split_counts["split_parents_deleted"],
+                "opacity_prune_deleted": opacity_prune_deleted,
+                "size_prune_deleted": prune_deleted_total - opacity_prune_deleted,
+                "prune_deleted_total": prune_deleted_total,
+                "gaussians_after": gaussians_after,
+            }
+
         torch.cuda.empty_cache()
+
+        if collect_diagnostics:
+            return event_counts
 
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)

@@ -7,6 +7,21 @@ from torchvision import transforms
 from tqdm import tqdm
 import trimesh
 import torch.nn.functional as F
+import sys
+
+REPOSITORY_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if REPOSITORY_ROOT not in sys.path:
+    sys.path.append(REPOSITORY_ROOT)
+
+from llff_view_protocol import (
+    ColmapImageRecord,
+    build_view_manifest,
+    load_view_manifest,
+    pdc_initialization_image_paths,
+    select_pdc_initialization_records,
+    validate_shared_camera_intrinsics,
+    validate_colmap_records,
+)
 
 from colmap_loader import read_intrinsics_binary, read_extrinsics_binary, qvec2rotmat
 from model_selection import model_type, pre_trained_model_types, select_model
@@ -33,6 +48,7 @@ parser.add_argument("--resolution", type=int, default=4)
 parser.add_argument("--dtu_sparse_indices", type=int, nargs="+", default=[25, 22, 28, 40, 44, 48, 0, 8, 13])
 parser.add_argument("--output_path", type=str, default="keypoints_to_3d")
 parser.add_argument("--dataset_name", type=str, default="LLFF")
+parser.add_argument("--view_manifest", type=str, default="")
 
 args = parser.parse_args()
 
@@ -48,11 +64,9 @@ if args.multi_stage_type not in choices_for_multi_stage_types:
 
 global_optim_iter = 3
 local_optim_iter = 7
-path_to_pre_trained_models = 'pre_trained_models/'
-matcher, estimate_uncertainty = select_model(args.network_type, args.pre_trained_model, args, global_optim_iter, local_optim_iter,
-                                             path_to_pre_trained_models=path_to_pre_trained_models)
+path_to_pre_trained_models = os.path.join(os.path.dirname(__file__), 'pre_trained_models')
 
-scene_name = os.path.basename(args.data_path)
+scene_name = os.path.basename(os.path.normpath(args.data_path))
 image_fold = "images"
 colmap_camera_bin = os.path.join(args.data_path, "sparse/0/cameras.bin")
 colmap_images_bin = os.path.join(args.data_path, "sparse/0/images.bin")
@@ -60,19 +74,62 @@ colmap_images_bin = os.path.join(args.data_path, "sparse/0/images.bin")
 # read cameras
 cam_intrinsics = read_intrinsics_binary(colmap_camera_bin)
 cam_extrinsics = read_extrinsics_binary(colmap_images_bin)
+records = [
+    ColmapImageRecord(extr.id, extr.camera_id, extr.name)
+    for extr in cam_extrinsics.values()
+]
+ordered_records = validate_colmap_records(
+    records, cam_intrinsics.keys(), os.path.join(args.data_path, image_fold)
+)
+ordered_image_names = [record.image_name for record in ordered_records]
+if args.dataset_name == "LLFF":
+    if args.view_manifest:
+        view_manifest = load_view_manifest(
+            args.view_manifest,
+            current_image_names=ordered_image_names,
+            expected_dataset="LLFF",
+            expected_scene=scene_name,
+            expected_view_count=args.n_views,
+        )
+    else:
+        view_manifest = build_view_manifest(
+            dataset="LLFF",
+            scene=scene_name,
+            image_names=ordered_image_names,
+            view_count=args.n_views,
+            source_commit="UNRECORDED-LEGACY-ENTRY",
+        )
+    selected_records = select_pdc_initialization_records(
+        ordered_records, view_manifest
+    )
+elif args.dataset_name == "DTU":
+    selected_global_indices = args.dtu_sparse_indices[:args.n_views]
+    if any(index < 0 or index >= len(ordered_records) for index in selected_global_indices):
+        raise IndexError("DTU initialization index is outside the sorted COLMAP image list")
+    selected_records = [ordered_records[index] for index in selected_global_indices]
+else:
+    raise NotImplementedError(args.dataset_name)
+
+# Build a compact, strictly aligned local view table. Only these image paths are
+# read below, so LLFF test pixels never enter the PDC image tensor or its cache.
 intrinsics_all = []
 extrinsics_all = []
 images_list = []
-for key in sorted(cam_extrinsics.keys()):
-    extr = cam_extrinsics[key]
+image_sizes = []
+selected_image_names = [record.image_name for record in selected_records]
+selected_paths = pdc_initialization_image_paths(
+    selected_records, os.path.join(args.data_path, image_fold)
+)
+for record, selected_path in zip(selected_records, selected_paths):
+    extr = cam_extrinsics[record.image_id]
     intr = cam_intrinsics[extr.camera_id]
     height = intr.height
     width = intr.width
+    image_sizes.append((width, height))
     R = np.transpose(qvec2rotmat(extr.qvec))
     T = np.array(extr.tvec)
-    c2w = getView2World(R, T)
-    extrinsics_all.append(c2w)
-    images_list.append(os.path.join(args.data_path, image_fold, extr.name))
+    extrinsics_all.append(getView2World(R, T))
+    images_list.append(str(selected_path))
 
     if intr.model == "SIMPLE_PINHOLE":
         focal_length_x = intr.params[0]
@@ -95,27 +152,38 @@ for key in sorted(cam_extrinsics.keys()):
     intrinsic[2, 2] = 1.0
     intrinsics_all.append(intrinsic)
 
-extrinsics_all = np.stack(extrinsics_all)
-intrinsics_all = np.stack(intrinsics_all)
-extrinsics_all = torch.tensor(extrinsics_all).float().cuda()
-intrinsics_all = torch.tensor(intrinsics_all).float().cuda()
+# The downstream triangulation, patch projection, and LLFF point sampling all
+# reuse intrinsics_all[0]. Fail closed unless every selected view has the same K
+# and image dimensions; partial per-view substitution would be mathematically
+# inconsistent with get_projected_patch_color/map_points_to_image.
+validate_shared_camera_intrinsics(
+    intrinsics_all,
+    image_sizes=image_sizes,
+    labels=selected_image_names,
+)
+width, height = image_sizes[0]
 
+extrinsics_all = torch.tensor(np.stack(extrinsics_all)).float().cuda()
+intrinsics_all = torch.tensor(np.stack(intrinsics_all)).float().cuda()
 
-n_images = len(images_list)
-if args.dataset_name == "LLFF":
-    llffhold=8
-    train_idx = [idx for idx in range(n_images) if idx % llffhold != 0]
-    idx_sub = [round(i) for i in np.linspace(0, len(train_idx) - 1, args.n_views)]
-elif args.dataset_name == "DTU":
-    idx_sub = args.dtu_sparse_indices[:args.n_views]
-else:
-    raise NotImplementedError(args.dataset_name)
-ref_indices = idx_sub
+# Indices are now local to the compact selected-view arrays, not global COLMAP
+# positions. Camera matrices, image paths, and tensors share this exact order.
+ref_indices = list(range(len(selected_records)))
+print("PDC initialization images:", selected_image_names)
 srcs_indices = {}
 for idx in ref_indices:
     indices = ref_indices.copy()
     indices.remove(idx)
     srcs_indices[idx] = indices
+
+matcher, estimate_uncertainty = select_model(
+    args.network_type,
+    args.pre_trained_model,
+    args,
+    global_optim_iter,
+    local_optim_iter,
+    path_to_pre_trained_models=path_to_pre_trained_models,
+)
 
 print("reading images ...")
 images = np.stack([imageio.v3.imread(image_name)[..., :3] for image_name in tqdm(images_list)])

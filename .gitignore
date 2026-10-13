@@ -1,0 +1,45 @@
+﻿# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Environments
+.venv/
+venv/
+env/
+
+# Experiment outputs
+output/
+outputs/
+runs/
+wandb/
+tensorboard/
+
+# Generated 3D points and datasets
+keypoints_to_3d/
+datasets/
+data/
+
+# Model weights and checkpoints
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+*.onnx
+*.h5
+
+# Generated depth caches and arrays
+*.npy
+*.npz
+
+# Logs and local backups
+*.log
+*.bak
+*.bak_*
+*.tmp
+
+# Windows
+Thumbs.db
+Desktop.ini

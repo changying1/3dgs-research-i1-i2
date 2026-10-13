@@ -53,6 +53,7 @@ class ModelParams(ParamGroup):
         self._images = "images"
         self._resolution = -1
         self._white_background = False
+        self._view_manifest = ""
         # self._white_background = True
         self.data_device = "cuda"
         self.eval = False
