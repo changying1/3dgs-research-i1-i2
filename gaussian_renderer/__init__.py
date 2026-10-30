@@ -17,7 +17,8 @@ from utils.sh_utils import eval_sh
 
 def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
            scaling_modifier = 1.0, override_color = None, dropout_factor=0.0, 
-           sigma_noise = 0.0, render_pts=False, render_pts_scale=0.1, train=True):
+           sigma_noise = 0.0, render_pts=False, render_pts_scale=0.1, train=True,
+           dropout_generator=None, opacity_noise_generator=None):
     """
     Render the scene. 
     
@@ -39,11 +40,15 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor,
     
     # init random dropout mask
     if dropout_factor > 0.0 and train:
-        dropout_mask = torch.rand(opacity.shape[0], device=opacity.device).cuda()
-        dropout_mask = dropout_mask < (1 - dropout_factor)
+        dropout_random_values = torch.rand(
+            opacity.shape[0], device=opacity.device, generator=dropout_generator
+        ).cuda()
+        dropout_mask = dropout_random_values < (1 - dropout_factor)
     else:
-        dropout_mask = torch.rand(opacity.shape[0], device=opacity.device).cuda()
-        dropout_mask = dropout_mask < 1.1
+        dropout_random_values = torch.rand(
+            opacity.shape[0], device=opacity.device, generator=dropout_generator
+        ).cuda()
+        dropout_mask = dropout_random_values < 1.1
 
     # The installed FSGS rasterizer scales per-Gaussian gradients by confidence.
     # Unit confidence preserves the existing gradients and must match the exact
@@ -119,7 +124,10 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor,
     # 2. add noise to opacity during training
     if train and sigma_noise > 0.0:
         # sigma_noise = 0.8  # 0.8
-        epsilon_opacity = torch.randn_like(opacity, device=opacity.device) * sigma_noise
+        epsilon_opacity = torch.randn(
+            opacity.shape, dtype=opacity.dtype, device=opacity.device,
+            generator=opacity_noise_generator,
+        ) * sigma_noise
         epsilon_opacity = torch.clamp(epsilon_opacity, min=-sigma_noise, max=sigma_noise)  # 根据实际训练经验设定合理范围
         opacity = torch.clamp(opacity * (1.0 + epsilon_opacity), min=0.0, max=1.0)
 
@@ -143,5 +151,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor,
             "rendered_depth": depth,
             "rendered_alpha": alpha,
             "visi_area": alpha > 0.8,
-            "dropout_mask": dropout_mask
+            "dropout_mask": dropout_mask,
+            # Retain raw variates only for the explicit isolated-generator path;
+            # legacy/default callers keep the previous output-memory behavior.
+            "dropout_random_values": dropout_random_values if dropout_generator is not None else None,
             }

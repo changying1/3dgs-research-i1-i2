@@ -1,0 +1,18 @@
+{
+  "version": "ns30k-frozen-assets-v1",
+  "scene": "flower",
+  "source_class": "current_frozen_generation_flow",
+  "legacy_fsgs_asset_reused": false,
+  "generation_record": "output/Flower_3v_FrozenPDC_v1/initialization_freeze.json",
+  "generation_record_sha256": "88242c6755ecbdaaec32ea46464b26be97098f5b157d6290b3f94573995fbdca",
+  "manifest": "output/Flower_3v_FrozenPDC_v1/view_manifest.json",
+  "manifest_sha256": "fdabbc6dcf4cc49e32fb4c055a0a2f0ef7c7455c9610814edf9232dcad792b6e",
+  "pdc": "keypoints_to_3d/LLFF_Flower_3v_FrozenPDC_v1/flower_keypoints_to_3d.ply",
+  "pdc_sha256": "0bad102dd2a8af06465927da9a0dec61654f3d55498286acd76497837762b751",
+  "cache_metadata": "output/I1_Flower_3v_MiDaS_DPT_Hybrid_Cache_v2/oe_depth_cache.json",
+  "cache_metadata_sha256": "3bc9a8fbfae94e5f02d07618da9194ebfd5589c6e97998a6a89230e3171d82cd",
+  "sampling_table": "reports/ns30k_frozen_sampling/flower_seed0_v1.json",
+  "sampling_sha256": "35b29382876b82d9b75069af20e754fc25ca30274fea9e9ea1082e74526265b9",
+  "selected_train_images": ["IMG_2963.JPG", "IMG_2979.JPG", "IMG_2995.JPG"],
+  "test_images": ["IMG_2962.JPG", "IMG_2970.JPG", "IMG_2978.JPG", "IMG_2986.JPG", "IMG_2994.JPG"]
+}

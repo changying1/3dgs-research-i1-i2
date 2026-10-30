@@ -146,6 +146,25 @@ class GaussianModel:
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
+    def apply_initial_opacity_probabilities(self, probabilities):
+        """Replace only pre-optimizer opacity logits for an initialization ablation."""
+        if self.optimizer is not None:
+            raise RuntimeError("initial opacity modulation must run before optimizer creation")
+        values = torch.as_tensor(
+            probabilities, dtype=self._opacity.dtype, device=self._opacity.device
+        ).reshape(-1, 1)
+        if values.shape != self._opacity.shape:
+            raise ValueError(
+                "initial opacity count mismatch: {} versus {}".format(
+                    values.shape[0], self._opacity.shape[0]
+                )
+            )
+        if not bool(torch.isfinite(values).all()) or not bool(((values > 0) & (values < 1)).all()):
+            raise ValueError("initial opacity probabilities must be finite and in (0, 1)")
+        self._opacity = nn.Parameter(
+            self.inverse_opacity_activation(values).requires_grad_(True)
+        )
+
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
@@ -350,7 +369,8 @@ class GaussianModel:
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
-    def densify_and_split(self, grads, grad_threshold, scene_extent, N=2, collect_diagnostics=False):
+    def densify_and_split(self, grads, grad_threshold, scene_extent, N=2,
+                          collect_diagnostics=False, random_generator=None):
         n_init_points = self.get_xyz.shape[0]
         # Extract points that satisfy the gradient condition
         padded_grad = torch.zeros((n_init_points), device="cuda")
@@ -361,7 +381,7 @@ class GaussianModel:
 
         stds = self.get_scaling[selected_pts_mask].repeat(N,1)
         means =torch.zeros((stds.size(0), 3),device="cuda")
-        samples = torch.normal(mean=means, std=stds)
+        samples = torch.normal(mean=means, std=stds, generator=random_generator)
         rots = build_rotation(self._rotation[selected_pts_mask]).repeat(N,1,1)
         new_xyz = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_xyz[selected_pts_mask].repeat(N, 1)
         new_scaling = self.scaling_inverse_activation(self.get_scaling[selected_pts_mask].repeat(N,1) / (0.8*N))
@@ -409,7 +429,8 @@ class GaussianModel:
         if collect_diagnostics:
             return clone_added
 
-    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, collect_diagnostics=False):
+    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size,
+                          collect_diagnostics=False, random_generator=None):
         if collect_diagnostics:
             gaussians_before = self.get_xyz.shape[0]
 
@@ -417,7 +438,10 @@ class GaussianModel:
         grads[grads.isnan()] = 0.0
 
         clone_added = self.densify_and_clone(grads, max_grad, extent, collect_diagnostics=collect_diagnostics)
-        split_counts = self.densify_and_split(grads, max_grad, extent, collect_diagnostics=collect_diagnostics)
+        split_counts = self.densify_and_split(
+            grads, max_grad, extent, collect_diagnostics=collect_diagnostics,
+            random_generator=random_generator,
+        )
 
         opacity_prune_mask = (self.get_opacity < min_opacity).squeeze()
         prune_mask = opacity_prune_mask

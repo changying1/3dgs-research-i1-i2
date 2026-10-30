@@ -1,0 +1,30 @@
+{
+  "version": "ns30k-frozen-assets-v1",
+  "scene": "trex",
+  "source_class": "current_frozen_generation_flow",
+  "legacy_fsgs_asset_reused": false,
+  "generation_record": "output/T-Rex_3v_FrozenPDC_v1/initialization_freeze.json",
+  "generation_record_sha256": "c5607340975d77dec5553c7294b75e070c31ee97db5e7d92f4d0dae9b0256823",
+  "manifest": "output/T-Rex_3v_FrozenPDC_v1/view_manifest.json",
+  "manifest_sha256": "ae86e0ee71805cf04ac6b7bcea0bb0302aa1d08f41ddbe057308eabb2a6cf881",
+  "pdc": "keypoints_to_3d/LLFF_T-Rex_3v_FrozenPDC_v1/trex_keypoints_to_3d.ply",
+  "pdc_sha256": "14da7f12510582dabb347228a1bbc800a3e563566de6cfd55448fd93e5d34844",
+  "cache_metadata": "output/I1_T-Rex_3v_MiDaS_DPT_Hybrid_Cache_v2/oe_depth_cache.json",
+  "cache_metadata_sha256": "9090c99a6c08dbb205664b2a1a488c8b03f7339fedfd7d66a67f591a6caac27a",
+  "sampling_table": "reports/ns30k_frozen_sampling/trex_seed0_v1.json",
+  "sampling_sha256": "9b4e4de7abcfa35464043b655ceafc46ff586e400c9ce66ee546213bcd644263",
+  "selected_train_images": [
+    "DJI_20200223_163551_210.jpg",
+    "DJI_20200223_163616_980.jpg",
+    "DJI_20200223_163654_571.jpg"
+  ],
+  "test_images": [
+    "DJI_20200223_163548_810.jpg",
+    "DJI_20200223_163557_660.jpg",
+    "DJI_20200223_163604_605.jpg",
+    "DJI_20200223_163611_160.jpg",
+    "DJI_20200223_163620_700.jpg",
+    "DJI_20200223_163639_916.jpg",
+    "DJI_20200223_163646_755.jpg"
+  ]
+}

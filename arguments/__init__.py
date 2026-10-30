@@ -54,6 +54,12 @@ class ModelParams(ParamGroup):
         self._resolution = -1
         self._white_background = False
         self._view_manifest = ""
+        # I1-NewA-P2A is inert by default. Confidence/shuffle are initialization-only.
+        self.initial_opacity_arm = "control"
+        self.initial_opacity_scores = ""
+        self.initial_opacity_score_manifest = ""
+        self.initial_opacity_beta = 0.25
+        self.initial_opacity_shuffle_seed = 20261023
         # self._white_background = True
         self.data_device = "cuda"
         self.eval = False

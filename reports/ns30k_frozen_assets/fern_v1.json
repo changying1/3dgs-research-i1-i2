@@ -1,0 +1,18 @@
+{
+  "version": "ns30k-frozen-assets-v1",
+  "scene": "fern",
+  "source_class": "current_frozen_generation_flow",
+  "legacy_fsgs_asset_reused": false,
+  "generation_record": "output/Fern_3v_FrozenPDC_v1/run_manifest.json",
+  "generation_record_sha256": "021140073e24d4aac8310c0e2e2084e4be3877635f5f84b5b1aa0109abedacef",
+  "manifest": "output/Fern_3v_FrozenPDC_v1/view_manifest.json",
+  "manifest_sha256": "47542b30e71b6735b2a35bf027f468bec94002f829b9356ffee708ff8895df5a",
+  "pdc": "keypoints_to_3d/LLFF_Fern_3v_FrozenPDC_v1/fern_keypoints_to_3d.ply",
+  "pdc_sha256": "db637e49a7e18ce70235ada5e9363df2531c5a1b91ccc70b4299af48edd29a83",
+  "cache_metadata": "output/I1_Fern_3v_MiDaS_DPT_Hybrid_Cache_NS30K_v1/oe_depth_cache.json",
+  "cache_metadata_sha256": "139326c1d6f876dc55d387a6758e9bb6948378d5ac9d489f4d601e65b4ad9843",
+  "sampling_table": "reports/ns30k_frozen_sampling/fern_seed0_v1.json",
+  "sampling_sha256": "34e98a484a0513cd260a75eaf2f5e3400bfa41f65751a57d0d6aea08af0b0ee8",
+  "selected_train_images": ["IMG_4027.JPG", "IMG_4036.JPG", "IMG_4045.JPG"],
+  "test_images": ["IMG_4026.JPG", "IMG_4034.JPG", "IMG_4042.JPG"]
+}

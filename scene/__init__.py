@@ -19,6 +19,7 @@ from scene.gaussian_model import GaussianModel
 from arguments import ModelParams
 from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON, renderCameraList_from_camInfos
 from scene.cameras import Camera
+from utils.initial_opacity_confidence import load_verified_arm_opacities
 class Scene:
 
     gaussians : GaussianModel
@@ -90,6 +91,27 @@ class Scene:
                                                            "point_cloud.ply"))
         else:
             self.gaussians.create_from_pcd(scene_info.point_cloud, self.cameras_extent)
+            opacity_arm = getattr(args, "initial_opacity_arm", "control")
+            score_manifest = getattr(args, "initial_opacity_score_manifest", "")
+            if opacity_arm != "control" or score_manifest:
+                probabilities = load_verified_arm_opacities(
+                    args.initial_opacity_scores,
+                    args.initial_opacity_score_manifest,
+                    scene_info.ply_path,
+                    scene_info.point_cloud.points,
+                    opacity_arm,
+                    float(args.initial_opacity_beta),
+                    int(args.initial_opacity_shuffle_seed),
+                )
+                if opacity_arm != "control":
+                    self.gaussians.apply_initial_opacity_probabilities(probabilities)
+                    print(
+                        "[I1-NewA-P2A] applied initial opacity arm={} beta={} points={}".format(
+                            opacity_arm, args.initial_opacity_beta, len(probabilities)
+                        )
+                    )
+                else:
+                    print("[I1-NewA-P2A] validated Control PLY/row identity; opacity unchanged")
 
     def save(self, iteration):
         point_cloud_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))

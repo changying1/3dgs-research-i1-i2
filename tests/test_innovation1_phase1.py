@@ -83,6 +83,7 @@ from utils.oe_depth_cache import (
 from utils.oe_training import (
     I1Diagnostics,
     apply_oe_structural_training_loss,
+    oe_activation_details,
     validate_oe_training_configuration,
 )
 from llff_view_protocol import build_view_manifest, write_view_manifest
@@ -681,6 +682,54 @@ def test_invalid_i1_configuration_is_rejected_before_training():
     assert validate_oe_training_configuration(False, 0, 99, 1, 0) is None
 
 
+def test_resumed_b1_weak_continuation_keeps_configuration_reachable():
+    assert validate_oe_training_configuration(
+        True, 0.1, 1, 8000, 20000, first_iteration=8001,
+        weak_continuation=True, weak_start_iter=8001, weak_end_iter=20000,
+        weak_weight=0.02,
+    ) == (8001, 20000)
+    with pytest.raises(ValueError, match="no structural phase"):
+        validate_oe_training_configuration(
+            True, 0.1, 1, 8000, 8000, first_iteration=8001,
+            weak_continuation=True, weak_start_iter=8001, weak_end_iter=20000,
+            weak_weight=0.02,
+        )
+
+
+def test_b0_b1_boundary_activation_is_cpu_decidable():
+    b0 = oe_activation_details(True, 8001, 1, 8000, 0.1)
+    b1 = oe_activation_details(
+        True, 8001, 1, 8000, 0.1,
+        weak_continuation=True, weak_start_iter=8001, weak_end_iter=20000, weak_weight=0.02,
+    )
+    assert b0 == {"active": False, "phase": "inactive", "weight": 0.0}
+    assert b1 == {"active": True, "phase": "b1_weak_continuation", "weight": 0.02}
+
+
+def test_b1_boundary_diagnostic_records_effective_weight_and_pairs():
+    logs = []
+    diagnostics = I1Diagnostics({}, (8001, 8001), interval=1000, emit=logs.append)
+    rendered_leaf, reference, rgb = _inputs()
+    camera = SimpleNamespace(image_name="boundary", image_height=3, image_width=4)
+
+    class Cache:
+        def load_for_camera(self, *_args, **_kwargs):
+            return reference
+
+    apply_oe_structural_training_loss(
+        rendered_leaf * 1.0, enabled=True, iteration=8001, start_iter=1, end_iter=8000,
+        weight=0.1, weak_continuation=True, weak_start_iter=8001, weak_end_iter=20000,
+        weak_weight=0.02, depth_cache=Cache(), camera=camera, rendered_depth=rendered_leaf * 1.0,
+        gt_rgb=rgb, diagnostics=diagnostics, gate_mode="none",
+    )
+    activation = json.loads(logs[-1].removeprefix("[I1] "))
+    assert activation["iteration"] == 8001
+    assert activation["i1_phase"] == "b1_weak_continuation"
+    assert activation["i1_applied_weight"] == 0.02
+    assert activation["valid_structure_pair_count"] > 0
+    assert activation["active_pair_count"] > 0
+
+
 def test_train_integration_uses_primary_rendered_depth_and_helper():
     source = (ROOT / "train.py").read_text(encoding="utf-8")
     assert 'depth = render_pkg["rendered_depth"]' in source
@@ -713,6 +762,12 @@ class Innovation1Phase1Unittest(unittest.TestCase):
         for iteration, expected in ((9, False), (10, True), (20, True), (21, False)):
             with self.subTest(iteration=iteration):
                 test_activation_interval_is_inclusive(iteration, expected)
+
+    def test_b0_b1_boundary_phase(self):
+        test_b0_b1_boundary_activation_is_cpu_decidable()
+
+    def test_b1_boundary_diagnostic(self):
+        test_b1_boundary_diagnostic_records_effective_weight_and_pairs()
 
     def test_evidence_detach(self):
         test_reference_selection_and_evidence_detach_semantics()

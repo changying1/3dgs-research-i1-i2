@@ -6,7 +6,10 @@ import torch
 
 from utils.evidence_support import compute_real_depth_evidence_maps
 
-OE_STRUCTURE_GATE_MODES = ("none", "stable_only", "evidence_only", "stable_evidence", "matched_stable")
+OE_STRUCTURE_GATE_MODES = (
+    "none", "stable_only", "evidence_only", "stable_evidence", "matched_stable",
+    "stable_evidence_conflict",
+)
 
 
 def add_oe_structural_arguments(parser):
@@ -25,6 +28,27 @@ def add_oe_structural_arguments(parser):
         type=str,
         choices=OE_STRUCTURE_GATE_MODES,
         default="stable_evidence",
+    )
+    parser.add_argument(
+        "--oe_conflict_threshold", type=float, default=0.75,
+        help="Normalized depth residual threshold used by B2 conflict gating.",
+    )
+    parser.add_argument("--i1_b1_weak_continuation", action="store_true", default=False)
+    parser.add_argument("--i1_b1_weak_weight", type=float, default=0.02)
+    parser.add_argument("--i1_b1_weak_start_iter", type=int, default=8001)
+    parser.add_argument("--i1_b1_weak_end_iter", type=int, default=30000)
+    parser.add_argument(
+        "--i1_b1_weak_weight_schedule",
+        choices=("constant", "linear_decay"),
+        default="constant",
+        help=(
+            "Weak-continuation weight schedule. constant preserves the legacy inclusive "
+            "weak interval; linear_decay reaches zero and disables I1 at weak_end_iter."
+        ),
+    )
+    parser.add_argument(
+        "--i1_b1_weak_evidence_gamma", type=float, default=1.0,
+        help="Evidence exponent used only by the I1 B1 weak-continuation phase.",
     )
     parser.add_argument("--oe_depth_cache_dir", type=str, default="")
 
@@ -77,11 +101,14 @@ def compute_oe_structural_loss(
     valid_mask=None,
     gate_mode="stable_evidence",
     stable_quantile=0.80,
+    conflict_threshold=0.75,
+    evidence_gamma=1.0,
     eps=1e-8,
 ):
     if gate_mode not in OE_STRUCTURE_GATE_MODES:
         raise ValueError(f"gate_mode must be one of {', '.join(OE_STRUCTURE_GATE_MODES)}")
 
+    evidence_gamma = _validate_evidence_gamma(evidence_gamma)
     maps = compute_real_depth_evidence_maps(
         rendered_depth,
         reference_depth,
@@ -92,7 +119,7 @@ def compute_oe_structural_loss(
     rendered = maps["z_render"]
     zero = torch.as_tensor(rendered_depth, device=rendered.device).float().sum() * 0.0
     if not maps["normalized_valid"]:
-        stats = _empty_stats(gate_mode)
+        stats = _empty_stats(gate_mode, evidence_gamma)
         stats["reference_transform"] = maps["reference_transform"]
         return zero, stats, maps
 
@@ -118,16 +145,18 @@ def compute_oe_structural_loss(
         raise ValueError("stable_mask must match depth map shape.")
     stable = stable.detach()
 
-    horizontal = _pair_terms(rendered, reference, evidence, stable, valid, dim=1)
-    vertical = _pair_terms(rendered, reference, evidence, stable, valid, dim=0)
+    conflict = maps["normalized_absolute_residual"].detach() <= float(conflict_threshold)
+    horizontal = _pair_terms(rendered, reference, evidence, stable, valid, dim=1, conflict=conflict)
+    vertical = _pair_terms(rendered, reference, evidence, stable, valid, dim=0, conflict=conflict)
     pair_loss = torch.cat((horizontal["loss"], vertical["loss"]))
     pair_evidence = torch.cat((horizontal["evidence"], vertical["evidence"]))
     pair_stable = torch.cat((horizontal["stable"], vertical["stable"]))
     pair_valid = torch.cat((horizontal["valid"], vertical["valid"]))
+    pair_conflict = torch.cat((horizontal["conflict"], vertical["conflict"]))
 
     valid_pair_count = int(pair_valid.sum().item())
     if valid_pair_count == 0:
-        stats = _empty_stats(gate_mode)
+        stats = _empty_stats(gate_mode, evidence_gamma)
         stats["stable_pixel_fraction"] = _fraction(stable & valid, valid)
         stats["stable_threshold"] = stable_threshold
         stats["reference_transform"] = maps["reference_transform"]
@@ -149,7 +178,10 @@ def compute_oe_structural_loss(
     )
     stable_evidence_loss, _ = _weighted_loss(
         valid_loss,
-        _gate_weights(valid_evidence, valid_stable, "stable_evidence").detach(),
+        _gate_weights(
+            valid_evidence, valid_stable, "stable_evidence",
+            evidence_gamma=evidence_gamma,
+        ).detach(),
         zero,
         eps,
     )
@@ -165,12 +197,16 @@ def compute_oe_structural_loss(
         matched_gated_loss = loss
     else:
         alpha = None
-        weights = _gate_weights(valid_evidence, valid_stable, gate_mode).detach()
+        weights = _gate_weights(
+            valid_evidence, valid_stable, gate_mode, pair_conflict,
+            evidence_gamma=evidence_gamma,
+        ).detach()
         loss, weights = _weighted_loss(valid_loss, weights, zero, eps)
         matched_gated_loss = None
 
     stats = {
         "gate_mode": gate_mode,
+        "evidence_gamma": evidence_gamma,
         "raw_struct_loss": _safe_float(raw_loss.detach()),
         "gated_struct_loss": _safe_float(loss.detach()),
         "matched_strength_alpha": _safe_float(alpha),
@@ -183,6 +219,8 @@ def compute_oe_structural_loss(
         "stable_pixel_fraction": _fraction(stable & valid, valid),
         "valid_pair_count": valid_pair_count,
         "active_pair_count": int((weights > 0).sum().item()),
+        "conflict_pair_fraction": _safe_float((~pair_conflict).float().mean()),
+        "conflict_threshold": float(conflict_threshold),
         "stable_threshold": stable_threshold,
         "reference_transform": maps["reference_transform"],
     }
@@ -198,7 +236,7 @@ def _weighted_loss(valid_loss, weights, zero, eps):
     return loss, weights
 
 
-def _pair_terms(rendered, reference, evidence, stable, valid, dim):
+def _pair_terms(rendered, reference, evidence, stable, valid, dim, conflict):
     if dim == 1:
         left = (slice(None), slice(None, -1))
         right = (slice(None), slice(1, None))
@@ -219,23 +257,31 @@ def _pair_terms(rendered, reference, evidence, stable, valid, dim):
         & torch.isfinite(loss_map).detach()
         & torch.isfinite(evidence_map)
     ).detach()
+    conflict_map = (conflict[left] & conflict[right]).detach()
     return {
         "loss": loss_map.reshape(-1),
         "evidence": evidence_map.reshape(-1),
         "stable": stable_map.reshape(-1),
         "valid": valid_map.reshape(-1),
+        "conflict": conflict_map.reshape(-1),
     }
 
 
-def _gate_weights(evidence, stable, gate_mode):
+def _gate_weights(evidence, stable, gate_mode, conflict=None, evidence_gamma=1.0):
+    evidence_gamma = _validate_evidence_gamma(evidence_gamma)
+    powered_evidence = evidence if evidence_gamma == 1.0 else evidence.pow(evidence_gamma)
     if gate_mode == "none":
         return torch.ones_like(evidence)
     if gate_mode == "stable_only":
         return stable.to(dtype=evidence.dtype)
     if gate_mode == "evidence_only":
-        return evidence
+        return powered_evidence
     if gate_mode == "stable_evidence":
-        return stable.to(dtype=evidence.dtype) * evidence
+        return stable.to(dtype=evidence.dtype) * powered_evidence
+    if gate_mode == "stable_evidence_conflict":
+        if conflict is None:
+            raise ValueError("conflict mask is required for stable_evidence_conflict")
+        return stable.to(dtype=evidence.dtype) * powered_evidence * conflict.to(dtype=evidence.dtype)
     raise ValueError(f"Unsupported gate_mode: {gate_mode}")
 
 
@@ -266,9 +312,10 @@ def _evidence_distribution_stats(evidence, population_mask=None):
     }
 
 
-def _empty_stats(gate_mode):
+def _empty_stats(gate_mode, evidence_gamma=1.0):
     return {
         "gate_mode": gate_mode,
+        "evidence_gamma": float(evidence_gamma),
         "raw_struct_loss": 0.0,
         "gated_struct_loss": 0.0,
         "matched_strength_alpha": None,
@@ -288,6 +335,13 @@ def _empty_stats(gate_mode):
         "stable_threshold": None,
         "reference_transform": None,
     }
+
+
+def _validate_evidence_gamma(evidence_gamma):
+    evidence_gamma = float(evidence_gamma)
+    if not math.isfinite(evidence_gamma) or evidence_gamma <= 0.0:
+        raise ValueError("evidence_gamma must be finite and > 0.")
+    return evidence_gamma
 
 
 def _fraction(numerator_mask, denominator_mask):

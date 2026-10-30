@@ -15,9 +15,11 @@ I1_DIAGNOSTIC_INTERVAL = 1000
 
 
 def validate_oe_training_configuration(
-    enabled, weight, start_iter, end_iter, total_iterations, *, first_iteration=1
+    enabled, weight, start_iter, end_iter, total_iterations, *, first_iteration=1,
+    weak_continuation=False, weak_start_iter=8001, weak_end_iter=30000,
+    weak_weight=0.02, weak_evidence_gamma=1.0, weak_weight_schedule="constant",
 ):
-    """Reject experiments labelled I1 that cannot execute I1 even once."""
+    """Reject enabled I1 runs whose primary and weak phases are both unreachable."""
     if not bool(enabled):
         return None
     weight = float(weight)
@@ -29,14 +31,74 @@ def validate_oe_training_configuration(
         raise ValueError("I1 is enabled but --oe_structural_weight must be finite and > 0.")
     if start_iter > end_iter:
         raise ValueError("I1 activation interval is invalid: start_iter is greater than end_iter.")
-    active_start = max(first_iteration, start_iter)
-    active_end = min(total_iterations, end_iter)
-    if active_start > active_end:
-        raise ValueError(
-            "I1 is enabled but cannot activate during this training run: "
-            f"run=[{first_iteration}, {total_iterations}], configured=[{start_iter}, {end_iter}]."
+    intervals = [(start_iter, end_iter)]
+    if bool(weak_continuation):
+        weak_weight = float(weak_weight)
+        weak_start_iter = int(weak_start_iter)
+        weak_end_iter = int(weak_end_iter)
+        if not math.isfinite(weak_weight) or weak_weight <= 0.0:
+            raise ValueError("I1 weak continuation weight must be finite and > 0.")
+        weak_evidence_gamma = float(weak_evidence_gamma)
+        if not math.isfinite(weak_evidence_gamma) or weak_evidence_gamma <= 0.0:
+            raise ValueError("I1 weak continuation evidence gamma must be finite and > 0.")
+        if weak_start_iter > weak_end_iter:
+            raise ValueError("I1 weak continuation interval is invalid: start_iter is greater than end_iter.")
+        if weak_weight_schedule not in ("constant", "linear_decay"):
+            raise ValueError(f"Unsupported I1 weak continuation weight schedule: {weak_weight_schedule!r}.")
+        if weak_weight_schedule == "linear_decay" and weak_start_iter >= weak_end_iter:
+            raise ValueError("I1 linear-decay weak continuation requires start_iter < end_iter.")
+        weak_last_active_iter = (
+            weak_end_iter - 1 if weak_weight_schedule == "linear_decay" else weak_end_iter
         )
-    return active_start, active_end
+        intervals.append((weak_start_iter, weak_last_active_iter))
+    reachable = [
+        (max(first_iteration, phase_start), min(total_iterations, phase_end))
+        for phase_start, phase_end in intervals
+    ]
+    reachable = [(start, end) for start, end in reachable if start <= end]
+    if not reachable:
+        raise ValueError(
+            "I1 is enabled but cannot activate: no structural phase can activate during this training run: "
+            f"run=[{first_iteration}, {total_iterations}]."
+        )
+    return min(start for start, _ in reachable), max(end for _, end in reachable)
+
+
+def oe_activation_details(
+    enabled,
+    iteration,
+    start_iter,
+    end_iter,
+    weight,
+    *,
+    weak_continuation=False,
+    weak_start_iter=8001,
+    weak_end_iter=30000,
+    weak_weight=0.02,
+    weak_weight_schedule="constant",
+):
+    """Return the effective I1 phase and weight without touching tensors."""
+    primary = should_apply_oe_structural_loss(enabled, iteration, start_iter, end_iter, weight)
+    if weak_weight_schedule not in ("constant", "linear_decay"):
+        raise ValueError(f"Unsupported I1 weak continuation weight schedule: {weak_weight_schedule!r}.")
+    effective_weak_weight = float(weak_weight)
+    if weak_weight_schedule == "linear_decay":
+        if int(weak_start_iter) >= int(weak_end_iter):
+            raise ValueError("I1 linear-decay weak continuation requires start_iter < end_iter.")
+        fraction = (int(weak_end_iter) - int(iteration)) / (
+            int(weak_end_iter) - int(weak_start_iter)
+        )
+        effective_weak_weight *= min(max(fraction, 0.0), 1.0)
+    if not math.isfinite(effective_weak_weight) or effective_weak_weight < 0.0:
+        raise ValueError("I1 weak continuation applied weight must be finite and >= 0.")
+    weak = bool(weak_continuation) and should_apply_oe_structural_loss(
+        enabled, iteration, weak_start_iter, weak_end_iter, effective_weak_weight
+    )
+    if primary:
+        return {"active": True, "phase": "primary", "weight": float(weight)}
+    if weak:
+        return {"active": True, "phase": "b1_weak_continuation", "weight": effective_weak_weight}
+    return {"active": False, "phase": "inactive", "weight": 0.0}
 
 
 def apply_oe_structural_training_loss(
@@ -53,31 +115,72 @@ def apply_oe_structural_training_loss(
     gt_rgb=None,
     gate_mode="stable_evidence",
     stable_quantile=0.80,
+    conflict_threshold=0.75,
+    weak_continuation=False,
+    weak_start_iter=8001,
+    weak_end_iter=30000,
+    weak_weight=0.02,
+    weak_evidence_gamma=1.0,
+    weak_weight_schedule="constant",
     diagnostics=None,
     compute_fn=compute_oe_structural_loss,
     validate_fn=validate_rendered_depth,
 ):
     """Combine losses without touching cache or depth when the I1 gate is closed."""
-    if not should_apply_oe_structural_loss(enabled, iteration, start_iter, end_iter, weight):
+    activation = oe_activation_details(
+        enabled, iteration, start_iter, end_iter, weight,
+        weak_continuation=weak_continuation, weak_start_iter=weak_start_iter,
+        weak_end_iter=weak_end_iter, weak_weight=weak_weight,
+        weak_weight_schedule=weak_weight_schedule,
+    )
+    if not activation["active"]:
+        if (
+            diagnostics is not None
+            and weak_continuation
+            and weak_weight_schedule == "linear_decay"
+            and int(iteration) == int(weak_end_iter)
+        ):
+            diagnostics.record_phase_transition(
+                iteration,
+                phase="inactive",
+                applied_weight=0.0,
+                reason="linear_decay_endpoint_reached",
+            )
         return baseline_total_loss, None, None
     if depth_cache is None:
         raise RuntimeError("I1 is active but its validated depth cache is unavailable.")
     depth = validate_fn(rendered_depth, camera.image_height, camera.image_width)
     reference = depth_cache.load_for_camera(camera, device=depth.device, dtype=depth.dtype)
+    applied_gamma = (
+        float(weak_evidence_gamma)
+        if activation["phase"] == "b1_weak_continuation"
+        else 1.0
+    )
+    if not math.isfinite(applied_gamma) or applied_gamma <= 0.0:
+        raise ValueError("I1 weak continuation evidence gamma must be finite and > 0.")
     structural_loss, stats, _ = compute_fn(
         depth,
         reference,
         gt_rgb=gt_rgb,
         gate_mode=gate_mode,
         stable_quantile=stable_quantile,
+        conflict_threshold=conflict_threshold,
+        evidence_gamma=applied_gamma,
     )
-    weighted_loss = float(weight) * structural_loss
+    applied_weight = activation["weight"]
+    stats["i1_phase"] = activation["phase"]
+    stats["i1_applied_weight"] = applied_weight
+    stats["i1_evidence_gamma"] = applied_gamma
+    weighted_loss = applied_weight * structural_loss
     if not torch.isfinite(structural_loss).all() or not torch.isfinite(weighted_loss).all():
         if diagnostics is not None:
             diagnostics.record_nonfinite(iteration, structural_loss, weighted_loss, stats)
         raise FloatingPointError(f"I1 produced a non-finite structural loss at iteration {iteration}.")
     if diagnostics is not None:
-        diagnostics.record(iteration, structural_loss, weighted_loss, stats)
+        diagnostics.record(
+            iteration, structural_loss, weighted_loss, stats,
+            force=int(iteration) in (8001, int(weak_start_iter)),
+        )
     return baseline_total_loss + weighted_loss, structural_loss, stats
 
 
@@ -104,7 +207,7 @@ class I1Diagnostics:
             "diagnostic_interval": self.interval,
         })
 
-    def record(self, iteration, structural_loss, weighted_loss, stats):
+    def record(self, iteration, structural_loss, weighted_loss, stats, *, force=False):
         self.activation_count += 1
         valid_pairs = int(stats.get("valid_pair_count", 0))
         active_pairs = int(stats.get("active_pair_count", 0))
@@ -117,10 +220,14 @@ class I1Diagnostics:
             "weighted_oe_loss": float(weighted_loss.detach().item()),
             "valid_pair_count": valid_pairs,
             "active_pair_count": active_pairs,
+            "valid_structure_pair_count": valid_pairs,
             "mean_pair_evidence": stats.get("mean_pair_evidence"),
             "reference_transform": stats.get("reference_transform"),
+            "i1_phase": stats.get("i1_phase"),
+            "i1_applied_weight": stats.get("i1_applied_weight"),
+            "i1_evidence_gamma": stats.get("i1_evidence_gamma"),
         }
-        if self.activation_count == 1 or int(iteration) % self.interval == 0:
+        if force or self.activation_count == 1 or int(iteration) % self.interval == 0:
             self._emit(payload)
         if self.writer is not None:
             self.writer.add_scalar("i1/oe_struct_loss", payload["oe_struct_loss"], iteration)
@@ -129,6 +236,7 @@ class I1Diagnostics:
             self.writer.add_scalar("i1/active_pair_count", active_pairs, iteration)
             if payload["mean_pair_evidence"] is not None:
                 self.writer.add_scalar("i1/mean_pair_evidence", payload["mean_pair_evidence"], iteration)
+            self.writer.add_scalar("i1/evidence_gamma", payload["i1_evidence_gamma"], iteration)
             self.writer.add_text("i1/reference_transform", str(payload["reference_transform"]), iteration)
 
     def record_nonfinite(self, iteration, structural_loss, weighted_loss, stats):
@@ -147,11 +255,30 @@ class I1Diagnostics:
             "active_pair_count": active_pairs,
             "mean_pair_evidence": stats.get("mean_pair_evidence"),
             "reference_transform": stats.get("reference_transform"),
+            "i1_phase": stats.get("i1_phase"),
+            "i1_applied_weight": stats.get("i1_applied_weight"),
+            "i1_evidence_gamma": stats.get("i1_evidence_gamma"),
             "actual_activation_count": self.activation_count,
             "total_valid_pair_count": self.valid_pair_count,
             "total_active_pair_count": self.active_pair_count,
             "nonfinite_loss_seen": True,
         })
+
+    def record_phase_transition(self, iteration, *, phase, applied_weight, reason):
+        """Log an inactive boundary explicitly without counting it as an activation."""
+        payload = {
+            "event": "phase_transition",
+            "iteration": int(iteration),
+            "i1_active": False,
+            "i1_phase": str(phase),
+            "i1_applied_weight": float(applied_weight),
+            "reason": str(reason),
+        }
+        self._emit(payload)
+        if self.writer is not None:
+            self.writer.add_scalar("i1/applied_weight", payload["i1_applied_weight"], iteration)
+            self.writer.add_text("i1/phase", payload["i1_phase"], iteration)
+        return payload
 
     def record_densification_gradients(
         self,
